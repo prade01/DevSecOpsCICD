@@ -293,7 +293,7 @@ pipeline {
                     echo "Tomcat Service not running, restarting..."
 
                     sudo systemctl restart tomcat
-                    sleep 60
+                    sleep 380
 
                     STATUS1=$(systemctl is-active tomcat)
 
