@@ -1,0 +1,351 @@
+def COLOR_MAP = [
+    'SUCCESS': 'good',
+    'FAILURE': 'danger',
+    'ABORTED': 'warning',
+]
+
+def sonarProps
+def nexusProps
+def trivyProps
+
+pipeline {
+
+    agent any
+
+
+    tools {
+        maven 'MAVEN3.9'
+        jdk 'JDK17'
+    }
+    
+
+    environment {
+
+        scannerHome = tool 'SONAR6.2'
+        SLACK_CHANNEL = '#devopscicd'
+    }
+
+
+    stages {
+
+        stage('Checkout Application') {
+            steps {
+                dir('app') {
+                    git branch:'jdk17',
+                    url:'https://github.com/prade01/demo-project.git'
+                }
+            }
+        }
+
+        stage('Checkout CI Config') {
+            steps {
+                dir('ci') {
+                    git branch:'local',
+                    url:'https://github.com/prade01/DevSecOpsCICD.git'
+                }
+            }
+        }
+
+        stage('Load Properties') {
+            steps {
+                script {
+                    sonarProps = readProperties file: 'ci/sonar/sonar.properties'
+                    nexusProps = readProperties file: 'ci/nexus/nexus.properties'
+                    trivyProps = readProperties file: 'ci/trivy/trivy.properties'
+
+                    //echo "Sonar URL: ${sonarProps['sonar.host.url']}"
+                    //echo "Nexus URL: ${nexusProps['nexus.url']}"
+                    //echo "Loaded Properties: ${sonarProps}"
+                    //echo "ProjectKey = ${sonarProps['sonar.projectKey']}"
+                    //echo "ProjectName = ${sonarProps['sonar.projectName']}"
+                }
+            }
+        }
+
+
+        stage('Compile Code') {
+            steps {
+                dir('app'){
+                    sh 'mvn clean compile'
+                }
+            }
+        }
+
+
+        stage('Checkstyle') {
+            steps {
+                dir('app'){
+                    sh 'mvn checkstyle:checkstyle'
+                }
+            }
+        }
+
+
+        stage('JUnit Tests') {
+            steps {
+                dir('app'){
+                    sh 'mvn test'
+                }
+            }
+        }
+
+
+        stage('Build Artifact') {
+            steps {
+                dir('app'){
+                    sh 'mvn package -DskipTests'
+                    archiveArtifacts artifacts: '**/*.war'
+                }
+            }
+        }
+
+
+        stage('Analysis Code Using Sonarqube') {
+            steps {
+
+                script {
+                    def jdkHome = tool 'JDK11'
+
+                    withEnv(["JAVA_HOME=${jdkHome}", "PATH+JAVA=${jdkHome}/bin"]) {
+
+                        sh 'java -version'
+
+                        dir('app'){
+
+                            withSonarQubeEnv('sonarserver') {
+
+                                sh """
+                                ${scannerHome}/bin/sonar-scanner \
+                                -Dsonar.projectKey=${sonarProps['sonar.projectkey']} \
+                                -Dsonar.projectName=${sonarProps['sonar.projectName']} \
+                                -Dsonar.projectVersion=${sonarProps['sonar.projectVersion']} \
+                                -Dsonar.sources=${sonarProps['sonar.sources']} \
+                                -Dsonar.java.binaries=${sonarProps['sonar.java.binaries']} \
+                                -Dsonar.junit.reportsPath=${sonarProps['sonar.junit.reportsPath']} \
+                                -Dsonar.jacoco.reportsPath=${sonarProps['sonar.jacoco.reportsPath']} \
+                                -Dsonar.java.checkstyle.reportPaths=${sonarProps['sonar.java.checkstyle.reportPaths']}
+                                """
+                            }
+                        }
+                    }
+                }
+
+            }
+        }
+
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES'){
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+
+        stage('Trivy Scan') {
+            steps {
+
+                dir('app'){
+
+                    sh """
+                    trivy ${trivyProps['trivy.scanType']} \
+                    ${trivyProps['trivy.version']} \
+                    --severity ${trivyProps['trivy.severity']} \
+                    --exit-code ${trivyProps['trivy.exitCode']} \
+                    --scanners ${trivyProps['trivy.scan']} \
+                    --format ${trivyProps['trivy.format1']} \
+                    -o ${trivyProps['trivy.table']} \
+                    .
+                    """
+                    archiveArtifacts artifacts: "${trivyProps['trivy.artifacttable']}"
+                }
+            }
+        }
+
+
+        stage('Upload Artifact to Nexus') {
+
+            steps {
+
+                script {
+
+                    nexusArtifactUploader(
+                      nexusVersion: 'nexus3',
+                      protocol: 'http',
+                      nexusUrl: nexusProps['nexus.url'],
+                      groupId: nexusProps['nexus.groupId'],
+                      version: "${env.BUILD_ID}-${env.BUILD_TIMESTAMP}",
+                      repository: nexusProps['nexus.repo'],
+                      credentialsId: 'nexuslogin',
+                      artifacts: [
+                        [
+                          artifactId: nexusProps['nexus.artifactId'],
+                          classifier: '',
+                          file: "app/target/${nexusProps['nexus.artifactFile']}",
+                          type: nexusProps['nexus.packaging']
+                        ]
+                      ]
+                    )
+
+                }
+            }
+        }
+
+        stage('Download Artifact from Nexus') {
+
+            steps {
+                script {
+                    def downloadUrl = "http://${nexusProps['nexus.url']}/repository/${nexusProps['nexus.repo']}/${nexusProps['nexus.groupId']}/${nexusProps['nexus.artifactId']}/${env.BUILD_ID}-${env.BUILD_TIMESTAMP}/vprofile-${env.BUILD_ID}-${env.BUILD_TIMESTAMP}.war"
+                    withCredentials([usernamePassword(
+                        credentialsId: 'nexuslogin',
+                        usernameVariable: 'NEXUS_USER',
+                        passwordVariable: 'NEXUS_PASS'
+                    )]) {
+
+                        sh """
+                        wget --user=\$NEXUS_USER --password=\$NEXUS_PASS \
+                        -O vprofile-nexus.war \
+                        ${downloadUrl}
+                        """
+                    }
+                }        
+                
+            }
+        }
+
+
+        stage('Blue-Green Deployment at Apache-tomcat-server') {
+            steps {
+                sh '''
+                echo "Starting Blue-Green Deployment"
+                ACTIVE=$(readlink /usr/local/tomcat/webapps/ROOT 2>/dev/null || echo 'none')
+                case "$ACTIVE" in 
+                    *blue*)
+                        NEW="green"
+                        OLD="blue"
+                        ;;
+                    *)
+                        NEW="blue"
+                        OLD="green"
+                        ;;
+                esac
+        
+                echo "Active: $ACTIVE"
+                echo "New deployment: $NEW"
+                echo "Rollback version: $OLD"
+
+                echo "Deploying new WAR..."
+                sudo cp vprofile-nexus.war /usr/local/tomcat/webapps/vprofile-$NEW.war
+
+                #### Removing old deployment
+
+                sudo rm /usr/local/tomcat/webapps/ROOT
+
+
+                ##### restarting tomcat server
+                sudo systemctl daemon-reload
+                sudo systemctl restart tomcat
+
+                sleep 30
+
+                ##### creating new symlink for new deployment
+
+                sudo ln -s /usr/local/tomcat/webapps/vprofile-$NEW /usr/local/tomcat/webapps/ROOT
+
+                sudo chown -R tomcat:tomcat /usr/local/tomcat/webapps
+
+                STATUS=$(systemctl is-active tomcat || true)
+                STATUS1=$(readlink /usr/local/tomcat/webapps/ROOT)
+                if [ "$STATUS" = "active" ] && (echo "$STATUS1" | grep -q blue || echo "$STATUS1" | grep -q green); then
+                    echo "Deployment Successfull"
+                else
+                    echo "Deployment Failed, please check and perform Rollback..."
+                    exit 1
+                fi
+                '''
+            }
+        }
+
+
+
+        stage('Checking service and application status') {
+            steps {
+                sh '''
+                STATUS=$(systemctl is-active tomcat || true)
+                PID=$(systemctl show -p MainPID --value tomcat)
+
+                if [ "$STATUS" = "active" ]; then
+                    echo "Tomcat Service is running with PID: $PID"
+                    echo "Checking application status...."
+                    sleep 400
+
+                    HTTP=$(curl -s -o /dev/null -w "%{http_code}" 'http://192.168.56.2:8080')
+
+                    if [ "$HTTP" -eq 200 ]; then
+                        echo "Health Check Passed: $HTTP Deployment Successful."
+                    else
+                        echo "Deployment Failed, kindly check logs"
+                        exit 1
+                    fi
+
+                else
+                    echo "Tomcat Service not running, restarting..."
+
+                    sudo systemctl restart tomcat
+                    sleep 60
+
+                    STATUS1=$(systemctl is-active tomcat)
+
+                    if [ "$STATUS1" = "active" ]; then
+                        PID=$(systemctl show -p MainPID --value tomcat)
+
+                        echo "Tomcat restarted successfully. PID: $PID"
+
+                        HTTP1=$(curl -s -o /dev/null -w "%{http_code}" 'http://192.168.56.2:8080')
+
+                        if [ "$HTTP1" -eq 200 ]; then
+                            echo "Health Check Passed: $HTTP1 Deployment Successful."
+                        else
+                            echo "Application not responding"
+                            exit 1
+                        fi
+
+                    else
+                        echo "Tomcat failed to restart. Kindly check logs:"
+                        echo "journalctl -u tomcat"
+                        exit 1
+                    fi
+                fi
+                '''
+            }
+        }
+
+
+
+ //       stage('Rollback Initiating on tomcat server'){
+ //           steps{
+ //               sh '''
+ //               HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" 'http://192.168.56.2:8080')
+ //               if [ "$HTTP_STATUS != 200"]; then
+ //                   echo ""
+ //               else
+  //                  echo ""
+  //              '''
+  //          }
+  //      }
+//
+
+
+    }
+
+    post {
+
+        always {
+
+            slackSend channel: "${SLACK_CHANNEL}",
+            color: COLOR_MAP[currentBuild.currentResult],
+            message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} build ${env.BUILD_NUMBER}\n${env.BUILD_URL}"
+        }
+    }
+}
