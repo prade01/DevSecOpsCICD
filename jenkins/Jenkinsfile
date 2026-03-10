@@ -32,7 +32,7 @@ pipeline {
             steps {
                 dir('app') {
                     git branch:'jdk17',
-                    url:'https://github.com/prade01/demo-project.git'
+                    url:'git@github.com:prade01/demo-project.git'
                 }
             }
         }
